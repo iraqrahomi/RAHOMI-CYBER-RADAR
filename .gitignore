@@ -1,0 +1,4 @@
+cyber_news.db
+__pycache__/
+.env
+*.log
