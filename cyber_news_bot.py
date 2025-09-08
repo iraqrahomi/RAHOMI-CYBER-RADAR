@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# cyber_news_bot.py — الرادار السيبراني (عربي/English + أيقونات + هاشتاقات)
+# cyber_news_bot.py — الرادار السيبراني (Inline Buttons + Arabic/English + Icons + Hashtags)
 import os, re, time, hashlib, sqlite3, requests
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 # ===== إعدادات عامة =====
 TZ = timezone(timedelta(hours=+3))  # Asia/Baghdad
 DB_PATH = "cyber_news.db"
-USER_AGENT = "Mozilla/5.0 (compatible; RahomiCyberRadar/1.2)"
+USER_AGENT = "Mozilla/5.0 (compatible; RahomiCyberRadar/1.3)"
 
 TG_TOKEN = os.getenv("TG_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
@@ -95,9 +95,8 @@ def classify_icon_and_tags(title: str, lang: str):
     for keys, ic, tg in checks:
         if any(k in t for k in keys):
             icon = ic; tags = tg; break
-    if lang == "ar":
-        # قدّم الهاشتاقات العربية أولاً
-        tags = sorted(tags, key=lambda x: 0 if x.startswith("#") and any(ch >= "\u0600" for ch in x) else 1)
+    # قدّم الهاشتاقات العربية أولاً
+    tags = sorted(tags, key=lambda x: 0 if any("\u0600" <= ch <= "\u06FF" for ch in x) else 1)
     return icon, " ".join(tags[:2])
 
 # ===== RSS =====
@@ -163,11 +162,13 @@ SCRAPERS = {
 def collect():
     ensure_db()
     total = 0
+    # RSS إنجليزي
     for name, cfg in EN_SOURCES.items():
         if cfg["type"] == "rss":
             try: total += pull_rss(name, cfg["url"], cfg["lang"])
             except Exception as e: print("[WARN-RSS]", name, str(e))
             time.sleep(0.8)
+    # Scraping عربي
     for name, cfg in AR_SOURCES.items():
         if cfg["type"] != "scrape": continue
         try:
@@ -183,66 +184,77 @@ def collect():
         time.sleep(1.2)
     return total
 
-# ===== إرسال تيليجرام (HTML) =====
-def tg_send(text):
+# ===== إرسال تيليجرام =====
+def tg_send_text(text):
     if not TG_TOKEN or not TG_CHAT_ID:
         print("[WARN] TG creds not set"); return False
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    r = requests.post(url, data=data, timeout=25)
+    data = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    r = requests.post(url, json=data, timeout=25)
     try:
         ok = r.json().get("ok", False)
     except Exception:
         ok = r.status_code == 200
     if not ok:
-        print("[TG ERR]", r.text[:300])
+        print("[TG ERR TEXT]", r.text[:300])
     return ok
 
-def build_section(rows, lang_label):
-    out = [f"<b>{lang_label}</b>"]
-    for src, title, url, pub, lang in rows:
-        icon, tags = classify_icon_and_tags(title, lang)
-        safe_title = html_escape(title)
-        show_url = html_escape(short_for_display(url, 58))
-        full_url = html_escape(url)
-        out.append(f"{icon} <b>[{html_escape(src)}]</b> {safe_title}\n🔗 <a href=\"{full_url}\">{show_url}</a>  <i>{tags}</i>")
-    return "\n".join(out)
+def tg_send_with_button(title_html, url_button):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("[WARN] TG creds not set"); return False
+    api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": title_html,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [[{"text": "🌐 المصدر", "url": url_button}]]
+        }
+    }
+    r = requests.post(api, json=payload, timeout=25)
+    try:
+        ok = r.json().get("ok", False)
+    except Exception:
+        ok = r.status_code == 200
+    if not ok:
+        print("[TG ERR BTN]", r.text[:300])
+    return ok
 
-def make_and_push_digest(limit=14):
+def build_item_html(src, title, url, lang):
+    icon, tags = classify_icon_and_tags(title, lang)
+    safe_title = html_escape(title)
+    show_url = short_for_display(url, 58)
+    # نص الرسالة (العنوان + هاشتاقات فقط، والزر يحمل الرابط)
+    text = f"{icon} <b>[{html_escape(src)}]</b> {safe_title}\n<i>{tags}</i>"
+    return text, url, show_url
+
+def make_and_push_digest(limit=14, pause=0.6):
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
     cur.execute("""SELECT source,title,url,published,lang FROM items ORDER BY ROWID DESC LIMIT ?""", (limit,))
     rows = cur.fetchall(); con.close()
     if not rows:
-        tg_send("لا توجد تحديثات جديدة حالياً ✅"); return
+        tg_send_text("لا توجد تحديثات جديدة حالياً ✅"); return
 
     # تقسيم حسب اللغة
     ar_rows = [r for r in rows if r[4] == "ar"]
     en_rows = [r for r in rows if r[4] == "en"]
 
-    parts = [f"⚡️ <b>خلاصة الرادار السيبراني</b> — {now_str()}", ""]
-    if ar_rows:
-        parts.append(build_section(ar_rows, "عربي"))
-        parts.append("")  # سطر فاصل
-    if en_rows:
-        parts.append(build_section(en_rows, "English"))
+    # رسالة رأسية
+    head = f"⚡️ <b>خلاصة الرادار السيبراني</b> — {now_str()}"
+    tg_send_text(head); time.sleep(pause)
 
-    # إرسال مع التقسيم في حال طول الرسالة
-    MAX = 3900
-    msg = "\n".join(parts)
-    if len(msg) <= MAX:
-        tg_send(msg)
-    else:
-        chunk = ""
-        for line in msg.split("\n"):
-            if len(chunk) + len(line) + 1 > MAX:
-                tg_send(chunk); chunk = ""
-            chunk += line + "\n"
-        if chunk.strip(): tg_send(chunk)
+    if ar_rows:
+        tg_send_text("<b>عربي</b>"); time.sleep(pause)
+        for src, title, url, pub, lang in ar_rows:
+            text_html, btn_url, _ = build_item_html(src, title, url, lang)
+            tg_send_with_button(text_html, btn_url); time.sleep(pause)
+
+    if en_rows:
+        tg_send_text("<b>English</b>"); time.sleep(pause)
+        for src, title, url, pub, lang in en_rows:
+            text_html, btn_url, _ = build_item_html(src, title, url, lang)
+            tg_send_with_button(text_html, btn_url); time.sleep(pause)
 
 # ===== التشغيل =====
 if __name__ == "__main__":
